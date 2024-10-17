@@ -10,6 +10,7 @@ declare(strict_types=1);
 namespace OCA\Mail\Service\AiIntegrations;
 
 use JsonException;
+use OCA\Mail\Db\Tag;
 use OCA\Mail\Account;
 use OCA\Mail\AppInfo\Application;
 use OCA\Mail\Contracts\IMailManager;
@@ -160,6 +161,88 @@ PROMPT;
 		}
 	}
 
+	public function getSmartTags(Account $account, Mailbox $mailbox, Message $message, string $currentUserId): array {
+    try {
+        $manager = $this->container->get(IManager::class);
+    } catch (\Throwable $e) {
+        throw new ServiceException('Text processing is not available in your current Nextcloud version', 0, $e);
+    }
+    if (in_array(FreePromptTaskType::class, $manager->getAvailableTaskTypes(), true)) {
+        $cachedTags = $this->cache->getValue('smartTags_'.$message->getId());
+        if ($cachedTags) {
+            return json_decode($cachedTags, true, 512);
+        }
+        $client = $this->clientFactory->getClient($account);
+        try {
+            $imapMessage = $this->mailManager->getImapMessage(
+                $client,
+                $account,
+                $mailbox,
+                $message->getUid(), true
+            );
+            if (!$this->isPersonalEmail($imapMessage)) {
+                return [];
+            }
+            $messageBody = $imapMessage->getPlainBody();
+        } finally {
+            $client->logout();
+        }
+        $prompt = "
+0 - No tag
+1 - Important
+2 - Work
+3 - Personal
+4 - To Do
+5 - Later
+
+Please classify the E-Mail with the most appropriate tags.
+Reason in detail through every tag and whether it makes sense to classify the e-mail as such out of the perspective of the recipient, and afterwards decide between contradictory tags (e.g work and personal) if sensible.
+Answer **only at the end** with the numbers of the corresponding tags separated by a comma (,) in curly braces.
+
+
+***START_OF_E-MAIL***
+$messageBody
+***END_OF_E-MAIL***
+";
+        $task = new Task(FreePromptTaskType::class, $prompt, 'mail,', $currentUserId);
+        $manager->runTask($task);
+				$output = $task->getOutput();
+				
+				preg_match_all('/\{([^}]*)\}/', $output, $matches);
+				$tagNumbers = trim(end($matches[1]));
+				if (empty($matches[1])) {
+					return [];
+				}
+
+				$tagNumbersArray = array_map('intval', explode(',', $tagNumbers));
+
+        $tagMap = [
+            1 => Tag::LABEL_IMPORTANT,
+            2 => Tag::LABEL_WORK,
+            3 => Tag::LABEL_PERSONAL,
+            4 => Tag::LABEL_TODO,
+            5 => Tag::LABEL_LATER,
+        ];
+
+        $tags = array_filter($tagNumbersArray, function($tag) {
+            return $tag !== 0;
+        });
+
+        $mappedTags = array_map(function($tag) use ($tagMap) {
+            return $tagMap[$tag] ?? null;
+        }, $tags);
+
+        $filteredTags = array_filter($mappedTags, function($tag) {
+            return $tag !== null;
+        });
+
+        $this->cache->addValue('smartTags_'.$message->getId(), json_encode($filteredTags));
+        return $filteredTags;
+    } else {
+        throw new ServiceException('No language model available for smart tags');
+    }
+}
+
 	public function getSmartReply(Account $account, Mailbox $mailbox, Message $message, string $currentUserId): ?array {
     try {
         $manager = $this->container->get(IManager::class);
@@ -206,11 +289,14 @@ PROMPT;
         $replies = $task->getOutput();
 
         try {
-            // Trim the replies
-            $replies = trim($replies);
             // Remove code fences if present
-            $replies = preg_replace('/^```(?:json)?\s*([\s\S]*?)\s*```$/i', '$1', $replies);
-            $decoded = json_decode($replies, true, 512, JSON_THROW_ON_ERROR);
+
+						// Regular expression to match the content between the first and last curly braces
+						$pattern = '/^.*?(\{.*\}).*$/s';
+
+						$replies = preg_replace($pattern, '$1', $replies);
+
+						$decoded = json_decode($replies, true, 512, JSON_THROW_ON_ERROR);
             $this->cache->addValue('smartReplies_'.$message->getId(), $replies);
             return $decoded;
         } catch (JsonException $e) {
