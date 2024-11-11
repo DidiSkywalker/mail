@@ -9,27 +9,26 @@ declare(strict_types=1);
 
 namespace OCA\Mail\Listener;
 
+use DateInterval;
+use DateTimeImmutable;
 use Horde_Imap_Client;
+use OCA\Mail\BackgroundJob\NewMessageClassificationJob;
 use OCA\Mail\Contracts\IMailManager;
-use OCA\Mail\Db\Tag;
-use OCA\Mail\Db\TagMapper;
 use OCA\Mail\Events\NewMessagesSynchronized;
-use OCA\Mail\Exception\ServiceException;
-use OCA\Mail\Service\AiIntegrations\AiIntegrationsService;
-use OCA\Mail\Service\Classification\ClassificationSettingsService;
-use OCA\Mail\Service\Classification\ImportanceClassifier;
-use OCP\AppFramework\Db\DoesNotExistException;
+use OCP\BackgroundJob\IJobList;
 use OCP\EventDispatcher\Event;
 use OCP\EventDispatcher\IEventListener;
-use OCP\BackgroundJob\IJobList;
+use OCA\Mail\Service\AiIntegrations\AiIntegrationsService;
 use Psr\Log\LoggerInterface;
-use OCP\IConfig;
+use OCP\TextProcessing\FreePromptTaskType;
+use OCA\Mail\Service\Classification\ClassificationSettingsService;
 
 
 /**
  * @template-implements IEventListener<Event|NewMessagesSynchronized>
  */
-class NewMessageClassificationListener implements IEventListener {
+class NewMessageClassificationListener implements IEventListener
+{
 	private const EXEMPT_FROM_CLASSIFICATION = [
 		Horde_Imap_Client::SPECIALUSE_ARCHIVE,
 		Horde_Imap_Client::SPECIALUSE_DRAFTS,
@@ -38,111 +37,66 @@ class NewMessageClassificationListener implements IEventListener {
 		Horde_Imap_Client::SPECIALUSE_TRASH,
 	];
 
-	/** @var ImportanceClassifier */
-	private $classifier;
+	public function __construct(
+		private IMailManager $mailManager,
+		private IJobList $jobList,
+		private AiIntegrationsService $aiService,
+    private LoggerInterface $logger,
+    private ClassificationSettingsService $classificationSettingsService,
 
-	/** @var TagMapper */
-	private $tagMapper;
+		) 	{}
 
-	/** @var LoggerInterface */
-	private $logger;
-
-	/** @var IMailManager */
-	private $mailManager;
-
-	private ClassificationSettingsService $classificationSettingsService;
-	private AiIntegrationsService $aiIntegrationsService;
-
-	public function __construct(ImportanceClassifier $classifier,
-		TagMapper $tagMapper,
-		LoggerInterface $logger,
-		IMailManager $mailManager,
-		ClassificationSettingsService $classificationSettingsService,
-		AiIntegrationsService $aiIntegrationsService
-		) {
-		$this->classifier = $classifier;
-		$this->logger = $logger;
-		$this->tagMapper = $tagMapper;
-		$this->mailManager = $mailManager;
-		$this->classificationSettingsService = $classificationSettingsService;
-		$this->aiIntegrationsService = $aiIntegrationsService;
-	}
-
-	public function handle(Event $event): void {
-    if (!($event instanceof NewMessagesSynchronized)) {
-        return;
-    }
+	public function handle(Event $event): void
+	{
+		$this->logger->info('Handling event!');
+		
+		if (!($event instanceof NewMessagesSynchronized)) {
+			$this->logger->info('Event is not an instance of NewMessagesSynchronized');
+			return;
+		}
 
     if (!$this->classificationSettingsService->isClassificationEnabled($event->getAccount()->getUserId())) {
-        return;
-    }
+			return;
+		}
 
-    foreach (self::EXEMPT_FROM_CLASSIFICATION as $specialUse) {
-        if ($event->getMailbox()->isSpecialUse($specialUse)) {
-            // Nothing to do then
-            return;
-        }
-    }
+		if (!$this->aiService->isLlmProcessingEnabled()) {
+			return;
+		}
 
-    $messages = $event->getMessages();
+		if (!$this->aiService->isLlmAvailable(FreePromptTaskType::class)) {
+			return;
+		}
 
-    // if this is a message that's been flagged / tagged as important before, we don't want to reclassify it again.
-    $doNotReclassify = $this->tagMapper->getTaggedMessageIdsForMessages(
-        $event->getMessages(),
-        $event->getAccount()->getUserId(),
-        Tag::LABEL_IMPORTANT
-    );
-    $messages = array_filter($messages, static function ($message) use ($doNotReclassify) {
-        return ($message->getFlagImportant() === false || in_array($message->getMessageId(), $doNotReclassify, true));
-    });
+		foreach (self::EXEMPT_FROM_CLASSIFICATION as $specialUse) {
+			if ($event->getMailbox()->isSpecialUse($specialUse)) {
+				$this->logger->info('Mailbox is exempt from classification: ' . $$event->getMailbox()->getRemoteId());
+				// Nothing to do then
+				return;
+			}
+		}
 
-    $optionalTags = [
-        Tag::LABEL_IMPORTANT,
-        Tag::LABEL_LATER,
-        Tag::LABEL_PERSONAL,
-        Tag::LABEL_TODO,
-        Tag::LABEL_WORK,
-    ];
+		$uid = $event->getAccount()->getUserId();
+		// Do not process emails older than 14D to save some processing power
+		$notBefore = (new DateTimeImmutable('now'))
+			->sub(new DateInterval('P14D'));
+		foreach ($event->getMessages() as $message) {
+			if ($message->getSentAt() < $notBefore->getTimestamp()) {
+				continue;
+			}
 
-    $tags = [];
+			if (sizeof($message->getTags()) !== 0) {
+				$this->logger->info('Mail already was tagged');
+				continue;
+			}
 
-    foreach ($optionalTags as $label) {
-        try {
-            $tag = $this->tagMapper->getTagByImapLabel($label, $event->getAccount()->getUserId());
-            $tags[$label] = $tag;
-        } catch (DoesNotExistException $e) {
-            // Log the error and continue with the next label
-            $this->logger->error('Could not find tag for label ' . $label . ' for user ' . $event->getAccount()->getUserId() . ': ' . $e->getMessage(), [
-                'exception' => $e,
-            ]);
-        }
-    }
+			$jobArguments = [
+				NewMessageClassificationJob::PARAM_MESSAGE_ID => $message->getMessageId(),
+				NewMessageClassificationJob::PARAM_MAILBOX_ID => $message->getMailboxId(),
+				NewMessageClassificationJob::PARAM_USER_ID => $uid,
+			];
 
-    try {
-        // Get smart tags from AI integration service
-        foreach ($messages as $message) {
-            $smartTags = $this->aiIntegrationsService->getSmartTags(
-                $event->getAccount(),
-                $event->getMailbox(),
-                $message,
-                $event->getAccount()->getUserId()
-            );
-
-            foreach ($smartTags as $smartTag) {
-                if (isset($tags[$smartTag])) {
-                    // Apply the tag to the message
-                    $this->mailManager->tagMessage($event->getAccount(), $event->getMailbox()->getName(), $message, $tags[$smartTag], true);
-                    if ($smartTag === Tag::LABEL_IMPORTANT) {
-                        // Additionally flag the message as important
-                        $this->mailManager->flagMessage($event->getAccount(), $event->getMailbox()->getName(), $message->getUid(), Tag::LABEL_IMPORTANT, true);
-                    }
-                }
-            }
-        }
-    } catch (ServiceException $e) {
-        $this->logger->error('Could not classify incoming message importance: ' . $e->getMessage(), [
-            'exception' => $e,
-        ]);
-    }
-}
+			$this->jobList->add(NewMessageClassificationJob::class, $jobArguments);
+			$this->logger->info('Added job!');
+		}
+	}
 }

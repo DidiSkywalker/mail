@@ -27,6 +27,8 @@ use OCP\TextProcessing\SummaryTaskType;
 use OCP\TextProcessing\Task;
 use Psr\Container\ContainerExceptionInterface;
 use Psr\Container\ContainerInterface;
+use function Codewithkyrian\Transformers\Pipelines\pipeline;
+
 use function array_map;
 use function implode;
 use function in_array;
@@ -161,6 +163,71 @@ PROMPT;
 		}
 	}
 
+	public function getSmartTagsZeroShotClassifier(Account $account, Mailbox $mailbox, Message $message, string $currentUserId): array {
+    $cachedTags = $this->cache->getValue('smartTags_'.$message->getId());
+    if ($cachedTags) {
+        return json_decode($cachedTags, true, 512);
+    }
+
+    $client = $this->clientFactory->getClient($account);
+    try {
+        $imapMessage = $this->mailManager->getImapMessage(
+            $client,
+            $account,
+            $mailbox,
+            $message->getUid(), true
+        );
+
+        $messageBody = $imapMessage->getPlainBody();
+    } finally {
+        $client->logout();
+    }
+
+    try {
+        // Load the zero-shot-classification pipeline (Xenova/distilbert-base-uncased-mnli)
+        $classifier = pipeline("zero-shot-classification");
+
+        // Define candidate labels
+        $candidateLabels = ['Important', 'Work', 'Personal', 'To Do', 'Later'];
+
+        // Classify the email text
+        $result = $classifier($messageBody, $candidateLabels);
+
+        $threshold = 0.25;
+
+        $selectedLabels = [];
+        foreach ($result['labels'] as $index => $label) {
+            if ($result['scores'][$index] >= $threshold) {
+                $selectedLabels[] = $label;
+            }
+        }
+
+        $labelToTagMap = [
+            'Important' => Tag::LABEL_IMPORTANT,
+            'Work' => Tag::LABEL_WORK,
+            'Personal' => Tag::LABEL_PERSONAL,
+            'To Do' => Tag::LABEL_TODO,
+            'Later' => Tag::LABEL_LATER,
+        ];
+
+        $mappedTags = array_map(function($label) use ($labelToTagMap) {
+            return $labelToTagMap[$label] ?? null;
+        }, $selectedLabels);
+
+        $filteredTags = array_filter($mappedTags, function($tag) {
+            return $tag !== null;
+        });
+
+        // Cache the tags
+        $this->cache->addValue('smartTags_'.$message->getId(), json_encode($filteredTags));
+
+        return $filteredTags;
+    } catch (\Throwable $e) {
+        throw new ServiceException('Language model is not available for smart tags', 0, $e);
+    }
+}
+
+
 	public function getSmartTags(Account $account, Mailbox $mailbox, Message $message, string $currentUserId): array {
     try {
         $manager = $this->container->get(IManager::class);
@@ -180,9 +247,7 @@ PROMPT;
                 $mailbox,
                 $message->getUid(), true
             );
-            if (!$this->isPersonalEmail($imapMessage)) {
-                return [];
-            }
+
             $messageBody = $imapMessage->getPlainBody();
         } finally {
             $client->logout();
@@ -196,7 +261,7 @@ PROMPT;
 5 - Later
 
 Please classify the E-Mail with the most appropriate tags.
-Reason in detail through every tag and whether it makes sense to classify the e-mail as such out of the perspective of the recipient, and afterwards decide between contradictory tags (e.g work and personal) if sensible.
+Reason in detail through every tag and whether it makes sense to classify the e-mail as such out of the perspective of the recipient, and afterwards decide between contradictory tags (example: work and personal).
 Answer **only at the end** with the numbers of the corresponding tags separated by a comma (,) in curly braces.
 
 
@@ -207,7 +272,7 @@ $messageBody
         $task = new Task(FreePromptTaskType::class, $prompt, 'mail,', $currentUserId);
         $manager->runTask($task);
 				$output = $task->getOutput();
-				
+
 				preg_match_all('/\{([^}]*)\}/', $output, $matches);
 				$tagNumbers = trim(end($matches[1]));
 				if (empty($matches[1])) {
@@ -236,7 +301,6 @@ $messageBody
             return $tag !== null;
         });
 
-        $this->cache->addValue('smartTags_'.$message->getId(), json_encode($filteredTags));
         return $filteredTags;
     } else {
         throw new ServiceException('No language model available for smart tags');
