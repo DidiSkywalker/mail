@@ -225,6 +225,8 @@
 			v-show="loading === LOADING_DONE"
 			:envelope="envelope"
 			:message="message"
+			:summary="summary"
+			:classification="classification"
 			:full-height="fullHeight"
 			:smart-replies="showFollowUpHeader ? [] : smartReplies"
 			:reply-button-label="replyButtonLabel"
@@ -384,6 +386,8 @@ export default {
 			showListUnsubscribeConfirmation: false,
 			error: undefined,
 			message: undefined,
+			summary: 'Loading...',
+			classification: 'Loading...',
 			importantSvg,
 			unsubscribing: false,
 			seenTimer: undefined,
@@ -636,6 +640,32 @@ export default {
 			try {
 				this.message = await this.$store.dispatch('fetchMessage', this.envelope.databaseId)
 				logger.debug(`message ${this.envelope.databaseId} fetched`, { message: this.message })
+
+				// ================= SUMMARY =======================
+				fetch('http://localhost:11434/api/generate', {
+					method: 'POST',
+					body: JSON.stringify({
+						model: 'llama3.2',
+						prompt: 'Summarize this email in two sentences: ' + this.message.body,
+						stream: false,
+					}),
+				}).then(async response => {
+					const json = await response.json()
+					this.summary = json.response
+				})
+
+				// ================= Tags =======================
+				fetch('http://localhost:11434/api/generate', {
+					method: 'POST',
+					body: JSON.stringify({
+						model: 'llama3.2',
+						prompt: 'Categorize the following email in one of these tags ("Appointments", "Free Time", "Newsletter", "Personal Registrations", "Shopping", and "Work"). Only respond with the Tag you assign without quotation marks and nothing else. The email: ' + this.message.body,
+						stream: false,
+					}),
+				}).then(async response => {
+					const json = await response.json()
+					this.classification = json.response
+				})
 
 				if (!this.envelope.flags.seen && this.hasSeenAcl) {
 					logger.info('Starting timer to mark message as seen/read')

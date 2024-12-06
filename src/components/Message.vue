@@ -8,6 +8,7 @@
 		role="region"
 		:aria-label="t('mail','Message body')">
 		<PhishingWarning v-if="message.phishingDetails.warning" :phishing-data="message.phishingDetails.checks" />
+		<AISummary :summary-text="summary" :classification="classification" />
 		<div v-if="message.smime.isSigned && !message.smime.signatureIsValid"
 			class="invalid-signature-warning">
 			<LockOffIcon :size="16"
@@ -77,6 +78,7 @@ import MessagePlainTextBody from './MessagePlainTextBody.vue'
 import Imip from './Imip.vue'
 import LockOffIcon from 'vue-material-design-icons/LockOff.vue'
 import ReplyIcon from 'vue-material-design-icons/Reply.vue'
+import AISummary from './AISummary.vue'
 
 export default {
 	name: 'Message',
@@ -87,6 +89,7 @@ export default {
 		MessageHTMLBody,
 		MessagePlainTextBody,
 		PhishingWarning,
+		AISummary,
 		Imip,
 		LockOffIcon,
 		ReplyIcon,
@@ -100,6 +103,16 @@ export default {
 		message: {
 			required: true,
 			type: Object,
+		},
+		summary: {
+			required: false,
+			type: String,
+			default: 'default summary',
+		},
+		classification: {
+			required: false,
+			type: String,
+			default: 'loading',
 		},
 		fullHeight: {
 			required: false,
